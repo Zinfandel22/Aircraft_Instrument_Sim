@@ -286,10 +286,13 @@ void variometerAudioTask(void *)
     constexpr float kMaximumClimbRateFtPerMinute = 3000.0f;
     constexpr float kVarioAmplitude = 26000.0f;
     constexpr float kTwoPi = 6.28318530718f;
-    constexpr uint32_t kClimbBeepSamples = kSampleRate / 10;
+    constexpr uint32_t kClimbBeepSamples = kSampleRate * 16 / 100;
+    constexpr uint32_t kEnvelopeSamples = kSampleRate * 5 / 1000;
+    constexpr float kEnvelopeStep = 1.0f / kEnvelopeSamples;
     int16_t samples[kFrameSamples * 2];
     float filteredVerticalSpeed = 0.0f;
     float phase = 0.0f;
+    float amplitudeEnvelope = 0.0f;
     float activeBeepFrequencyHz = 500.0f;
     uint32_t activeBeepCycleSamples = 0;
     uint32_t beepSamplesRemaining = 0;
@@ -341,9 +344,13 @@ void variometerAudioTask(void *)
                 silenceSamplesRemaining = 0;
             }
 
-            const int16_t sample = audible
-                ? static_cast<int16_t>(sinf(phase) * kVarioAmplitude)
-                : 0;
+            if (audible) {
+                amplitudeEnvelope = fminf(1.0f, amplitudeEnvelope + kEnvelopeStep);
+            } else {
+                amplitudeEnvelope = fmaxf(0.0f, amplitudeEnvelope - kEnvelopeStep);
+            }
+            const int16_t sample = static_cast<int16_t>(
+                sinf(phase) * kVarioAmplitude * amplitudeEnvelope);
             samples[index * 2] = sample;
             samples[index * 2 + 1] = sample;
             phase += kTwoPi * frequencyHz / kSampleRate;
