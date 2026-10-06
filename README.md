@@ -20,7 +20,15 @@ This project targets the Waveshare ESP32-S3-Touch-AMOLED-1.75 (standard, product
 - Touch input cycles through the instrument screens
 - Attitude pitch and roll use raw QMI8658 accelerometer X/Y/Z; +X near 1 g defines level
 - Compass heading is gyro-relative and will drift because this board has no magnetometer
-- Altitude is a pitch-derived estimate at 100 ft/min per degree of pitch (nose-up descends); connect a barometer or aircraft telemetry for measured altitude
+- Altitude is a pitch-derived estimate at 100 ft/min per degree of pitch (positive pitch increases the estimate); connect a barometer or aircraft telemetry for measured altitude
+
+## Variometer
+- The QMI8658 pitch angle is converted to a rate command at 100 ft/min per degree. Positive rates indicate climb; negative rates indicate descent.
+- Positive rate samples are averaged over the latest eight updates before reaching the audio task. The audio task applies additional low-pass smoothing to avoid abrupt cue changes.
+- Rates above 50 ft/min produce climb beeps. Beep pitch rises from 500 to 1,400 Hz and the interval shortens from 900 to 250 ms as the filtered rate approaches 3,000 ft/min. Each 100 ms beep completes at its starting pitch; rate changes affect the next beep.
+- Rates below -50 ft/min produce a continuous 260 Hz descent tone. Rates within the deadband are silent.
+- Audio uses the ES8311 codec and the ESP32-S3 I2S output at 16 kHz, 16-bit stereo. A short 1 kHz tone plays at startup to verify the speaker path.
+- This is a pitch-driven estimate, not measured aircraft vertical speed. Use a barometer or aircraft telemetry for a true variometer.
 
 ## Getting started
 1. Install PlatformIO and the VS Code PlatformIO extension.
