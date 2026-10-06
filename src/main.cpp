@@ -77,7 +77,7 @@ float g_pitchDeg = 0.0f;
 float g_rollDeg = 0.0f;
 float g_turnCoordinatorRollDeg = 0.0f;
 float g_headingDeg = 0.0f;
-float g_altitudeFt = 6300.0f;
+float g_altitudeFt = 0000.0f;
 float g_lateralAccelerationMps2 = 0.0f;
 uint32_t g_lastImuUpdateMs = 0;
 float g_gravityX = 0.0f;
@@ -255,7 +255,7 @@ void updateAltitudeFromPitch()
     const uint32_t elapsedMs = now - previousUpdateMs;
     previousUpdateMs = now;
 
-    const float verticalSpeedFtPerMinute = -g_pitchDeg * 100.0f;
+    const float verticalSpeedFtPerMinute = g_pitchDeg * 100.0f;
 
     g_altitudeFt += verticalSpeedFtPerMinute * (elapsedMs / 60000.0f);
     g_altitudeFt = constrain(g_altitudeFt, 0.0f, 99999.0f);
