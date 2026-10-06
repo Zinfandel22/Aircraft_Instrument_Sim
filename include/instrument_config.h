@@ -23,4 +23,10 @@ constexpr uint8_t kTouchAddress = 0x5A;
 constexpr uint8_t kImuAddress = 0x6B;
 constexpr uint8_t kPmicAddress = 0x34;
 
+constexpr uint8_t kAudioMclkPin = 42;
+constexpr uint8_t kAudioBclkPin = 9;
+constexpr uint8_t kAudioLrclkPin = 45;
+constexpr uint8_t kAudioDoutPin = 8;
+constexpr uint8_t kAudioPaPin = 46;
+
 }  // namespace aircraft

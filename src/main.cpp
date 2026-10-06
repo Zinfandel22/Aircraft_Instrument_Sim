@@ -2,7 +2,9 @@
 #include <ImuDrv.hpp>
 #include <XPowersLib.h>
 #include <esp_heap_caps.h>
+#include <driver/i2s.h>
 #include <Wire.h>
+#include <math.h>
 
 #include "instrument_config.h"
 
@@ -49,7 +51,11 @@ public:
 PsramCanvas *g_tft = new PsramCanvas(g_display);
 XPowersAXP2101 g_pmic;
 SensorQMI8658 g_imu;
+volatile float g_verticalSpeedFtPerMinute = 0.0f;
 bool g_imuReady = false;
+
+constexpr uint8_t kEs8311Address = 0x18;
+constexpr i2s_port_t kAudioI2sPort = I2S_NUM_0;
 
 constexpr uint16_t kBlack = 0x0000;
 constexpr uint16_t kWhite = 0xFFFF;
@@ -127,6 +133,237 @@ bool initializePmic()
     g_pmic.enableALDO3();
     delay(250);
     return true;
+}
+
+bool initializeAudio()
+{
+    auto writeRegister = [](uint8_t reg, uint8_t value) {
+        Wire.beginTransmission(kEs8311Address);
+        Wire.write(reg);
+        Wire.write(value);
+        return Wire.endTransmission() == 0;
+    };
+    auto readRegister = [](uint8_t reg) -> uint8_t {
+        Wire.beginTransmission(kEs8311Address);
+        Wire.write(reg);
+        if (Wire.endTransmission(false) != 0 ||
+            Wire.requestFrom(static_cast<int>(kEs8311Address), 1) != 1) {
+            return 0;
+        }
+        return static_cast<uint8_t>(Wire.read());
+    };
+    auto updateRegister = [&](uint8_t reg, uint8_t andMask, uint8_t orMask) {
+        return writeRegister(reg, static_cast<uint8_t>((readRegister(reg) & andMask) | orMask));
+    };
+
+    pinMode(aircraft::kAudioPaPin, OUTPUT);
+    digitalWrite(aircraft::kAudioPaPin, LOW);
+    const uint8_t idHigh = readRegister(0xFD);
+    const uint8_t idLow = readRegister(0xFE);
+    if (idHigh != 0x83) {
+        Serial.printf("ES8311 not detected (ID 0x%02X 0x%02X).\n", idHigh, idLow);
+        return false;
+    }
+
+    bool codecReady = true;
+    auto write = [&](uint8_t reg, uint8_t value) {
+        codecReady = writeRegister(reg, value) && codecReady;
+    };
+    write(0x0D, 0xFA);
+    write(0x44, 0x08);
+    write(0x44, 0x08);
+    write(0x01, 0x30);
+    write(0x02, 0x00);
+    write(0x03, 0x10);
+    write(0x16, 0x24);
+    write(0x04, 0x10);
+    write(0x05, 0x00);
+    write(0x0B, 0x00);
+    write(0x0C, 0x00);
+    write(0x10, 0x1F);
+    write(0x11, 0x7F);
+    write(0x00, 0x80);
+    write(0x00, 0x80);
+    write(0x01, 0xBF);
+    codecReady = updateRegister(0x06, static_cast<uint8_t>(~0x20), 0x00) && codecReady;
+    write(0x13, 0x10);
+    write(0x1B, 0x0A);
+    write(0x1C, 0x6A);
+    write(0x44, 0x58);
+    write(0x02, 0x18);
+    write(0x05, 0x00);
+    write(0x03, 0x10);
+    write(0x04, 0x20);
+    codecReady = updateRegister(0x07, 0xC0, 0x00) && codecReady;
+    write(0x08, 0xFF);
+    codecReady = updateRegister(0x06, 0xE0, 0x03) && codecReady;
+    write(0x09, 0x0C);
+    write(0x0A, 0x0C);
+    write(0x00, 0x80);
+    write(0x01, 0xBF);
+    write(0x09, 0x0C);
+    write(0x0A, 0x0C);
+    write(0x17, 0xBF);
+    write(0x0E, 0x02);
+    write(0x12, 0x00);
+    write(0x14, 0x1A);
+    write(0x0D, 0x01);
+    write(0x15, 0x40);
+    write(0x37, 0x08);
+    write(0x45, 0x00);
+    write(0x32, 0xBF);
+    codecReady = updateRegister(0x31, 0x9F, 0x00) && codecReady;
+    if (!codecReady) {
+        Serial.println("ES8311 register configuration failed.");
+        return false;
+    }
+
+    i2s_config_t config = {};
+    config.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX);
+    config.sample_rate = 16000;
+    config.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+    config.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+    config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+    config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+    config.dma_desc_num = 4;
+    config.dma_frame_num = 256;
+    config.use_apll = false;
+    config.tx_desc_auto_clear = true;
+    config.fixed_mclk = 0;
+    config.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+    config.bits_per_chan = I2S_BITS_PER_CHAN_16BIT;
+    if (i2s_driver_install(kAudioI2sPort, &config, 0, nullptr) != ESP_OK) {
+        Serial.println("I2S driver initialization failed.");
+        return false;
+    }
+
+    i2s_pin_config_t pins = {};
+    pins.mck_io_num = aircraft::kAudioMclkPin;
+    pins.bck_io_num = aircraft::kAudioBclkPin;
+    pins.ws_io_num = aircraft::kAudioLrclkPin;
+    pins.data_out_num = aircraft::kAudioDoutPin;
+    pins.data_in_num = I2S_PIN_NO_CHANGE;
+    if (i2s_set_pin(kAudioI2sPort, &pins) != ESP_OK) {
+        i2s_driver_uninstall(kAudioI2sPort);
+        Serial.println("I2S pin configuration failed.");
+        return false;
+    }
+    i2s_zero_dma_buffer(kAudioI2sPort);
+    digitalWrite(aircraft::kAudioPaPin, HIGH);
+    delay(8);
+    int16_t testSamples[320];
+    float phase = 0.0f;
+    constexpr float kTwoPi = 6.28318530718f;
+    for (uint8_t frame = 0; frame < 20; ++frame) {
+        for (size_t index = 0; index < 160; ++index) {
+            const int16_t sample = static_cast<int16_t>(sinf(phase) * 12000.0f);
+            testSamples[index * 2] = sample;
+            testSamples[index * 2 + 1] = sample;
+            phase += kTwoPi * 1000.0f / 16000.0f;
+            if (phase >= kTwoPi) {
+                phase -= kTwoPi;
+            }
+        }
+        size_t bytesWritten = 0;
+        if (i2s_write(kAudioI2sPort, testSamples, sizeof(testSamples),
+                      &bytesWritten, portMAX_DELAY) != ESP_OK ||
+            bytesWritten != sizeof(testSamples)) {
+            digitalWrite(aircraft::kAudioPaPin, LOW);
+            i2s_driver_uninstall(kAudioI2sPort);
+            Serial.println("I2S startup test tone failed.");
+            return false;
+        }
+    }
+    Serial.printf("ES8311 ready (ID 0x%02X 0x%02X); startup tone sent.\n", idHigh, idLow);
+    return true;
+}
+
+void variometerAudioTask(void *)
+{
+    constexpr uint32_t kSampleRate = 16000;
+    constexpr size_t kFrameSamples = 160;
+    constexpr float kVarioDeadbandFtPerMinute = 50.0f;
+    constexpr float kMaximumClimbRateFtPerMinute = 3000.0f;
+    constexpr float kVarioAmplitude = 26000.0f;
+    constexpr float kTwoPi = 6.28318530718f;
+    constexpr uint32_t kClimbBeepSamples = kSampleRate / 10;
+    int16_t samples[kFrameSamples * 2];
+    float filteredVerticalSpeed = 0.0f;
+    float phase = 0.0f;
+    float activeBeepFrequencyHz = 500.0f;
+    uint32_t activeBeepCycleSamples = 0;
+    uint32_t beepSamplesRemaining = 0;
+    uint32_t silenceSamplesRemaining = 0;
+    bool writeErrorLogged = false;
+
+    while (true) {
+        const float targetVerticalSpeed = g_verticalSpeedFtPerMinute;
+        filteredVerticalSpeed += 0.12f * (targetVerticalSpeed - filteredVerticalSpeed);
+
+        const bool descending = filteredVerticalSpeed < -kVarioDeadbandFtPerMinute;
+        const bool climbing = filteredVerticalSpeed > kVarioDeadbandFtPerMinute;
+        float requestedBeepFrequencyHz = activeBeepFrequencyHz;
+        uint32_t requestedBeepCycleSamples = 0;
+        if (climbing) {
+            const float climbRate = constrain(filteredVerticalSpeed,
+                                               kVarioDeadbandFtPerMinute,
+                                               kMaximumClimbRateFtPerMinute);
+            const float climbProgress = (climbRate - kVarioDeadbandFtPerMinute) /
+                (kMaximumClimbRateFtPerMinute - kVarioDeadbandFtPerMinute);
+            requestedBeepFrequencyHz = 500.0f + climbProgress * 900.0f;
+            const float intervalMs = 900.0f - climbProgress * 650.0f;
+            requestedBeepCycleSamples =
+                static_cast<uint32_t>(intervalMs * kSampleRate / 1000.0f);
+        }
+
+        for (size_t index = 0; index < kFrameSamples; ++index) {
+            if (beepSamplesRemaining == 0 && climbing && silenceSamplesRemaining == 0) {
+                activeBeepFrequencyHz = requestedBeepFrequencyHz;
+                activeBeepCycleSamples = requestedBeepCycleSamples;
+                beepSamplesRemaining = kClimbBeepSamples;
+            }
+
+            bool audible = false;
+            float frequencyHz = 260.0f;
+            if (beepSamplesRemaining > 0) {
+                audible = true;
+                frequencyHz = activeBeepFrequencyHz;
+                --beepSamplesRemaining;
+                if (beepSamplesRemaining == 0) {
+                    silenceSamplesRemaining = activeBeepCycleSamples - kClimbBeepSamples;
+                }
+            } else if (descending) {
+                audible = true;
+                silenceSamplesRemaining = 0;
+            } else if (climbing && silenceSamplesRemaining > 0) {
+                --silenceSamplesRemaining;
+            } else {
+                silenceSamplesRemaining = 0;
+            }
+
+            const int16_t sample = audible
+                ? static_cast<int16_t>(sinf(phase) * kVarioAmplitude)
+                : 0;
+            samples[index * 2] = sample;
+            samples[index * 2 + 1] = sample;
+            phase += kTwoPi * frequencyHz / kSampleRate;
+            if (phase >= kTwoPi) {
+                phase -= kTwoPi;
+            }
+        }
+
+        size_t bytesWritten = 0;
+        const esp_err_t result = i2s_write(kAudioI2sPort, samples, sizeof(samples),
+                                           &bytesWritten, portMAX_DELAY);
+        if (result != ESP_OK || bytesWritten != sizeof(samples)) {
+            if (!writeErrorLogged) {
+                Serial.printf("I2S audio write failed (%d, %u bytes).\n",
+                              static_cast<int>(result), static_cast<unsigned>(bytesWritten));
+                writeErrorLogged = true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
 }
 
 bool initializeImu()
@@ -224,14 +461,6 @@ void updateImu()
         g_gravityZ += gravityAlpha * (az - g_gravityZ);
     }
 
-    if (now - g_lastImuLogMs >= 250) {
-        g_lastImuLogMs = now;
-        Serial.printf(
-            "[IMU] Gravity X=%+.2f Y=%+.2f Z=%+.2f m/s^2 | Accel x'=%+.2f y'=%+.2f z'=%+.2f m/s^2\n",
-            g_gravityX, g_gravityY, g_gravityZ,
-            ax - g_gravityX, ay - g_gravityY, az - g_gravityZ);
-    }
-
     const float accelRoll = wrapAngleDegrees(atan2f(-ay, ax) * 180.0f / PI);
     const float accelPitch = atan2f(az, sqrtf(ax * ax + ay * ay)) * 180.0f / PI;
 
@@ -245,7 +474,13 @@ void updateImu()
 
 void updateAltitudeFromPitch()
 {
+    constexpr size_t kPositiveRateWindowSize = 8;
+    static float positiveRateWindow[kPositiveRateWindowSize] = {};
+    static size_t positiveRateWindowNext = 0;
+    static size_t positiveRateWindowCount = 0;
+    static float positiveRateWindowSum = 0.0f;
     static uint32_t previousUpdateMs = 0;
+    static uint32_t lastVarioLogMs = 0;
     const uint32_t now = millis();
     if (previousUpdateMs == 0) {
         previousUpdateMs = now;
@@ -256,6 +491,28 @@ void updateAltitudeFromPitch()
     previousUpdateMs = now;
 
     const float verticalSpeedFtPerMinute = g_pitchDeg * 100.0f;
+    float audioVerticalSpeed = verticalSpeedFtPerMinute;
+    if (verticalSpeedFtPerMinute > 0.0f) {
+        if (positiveRateWindowCount == kPositiveRateWindowSize) {
+            positiveRateWindowSum -= positiveRateWindow[positiveRateWindowNext];
+        } else {
+            ++positiveRateWindowCount;
+        }
+        positiveRateWindow[positiveRateWindowNext] = verticalSpeedFtPerMinute;
+        positiveRateWindowSum += verticalSpeedFtPerMinute;
+        positiveRateWindowNext = (positiveRateWindowNext + 1) % kPositiveRateWindowSize;
+        audioVerticalSpeed = positiveRateWindowSum / positiveRateWindowCount;
+    } else {
+        positiveRateWindowNext = 0;
+        positiveRateWindowCount = 0;
+        positiveRateWindowSum = 0.0f;
+    }
+    g_verticalSpeedFtPerMinute = audioVerticalSpeed;
+    if (now - lastVarioLogMs >= 500) {
+        lastVarioLogMs = now;
+        Serial.printf("[VARIO] pitch=%+.2f deg, raw=%+.0f, averaged=%+.0f ft/min\n",
+                      g_pitchDeg, verticalSpeedFtPerMinute, audioVerticalSpeed);
+    }
 
     g_altitudeFt += verticalSpeedFtPerMinute * (elapsedMs / 60000.0f);
     g_altitudeFt = constrain(g_altitudeFt, 0.0f, 99999.0f);
@@ -964,6 +1221,7 @@ void setup()
     if (!initializePmic()) {
         Serial.println("AXP2101 was not detected; display rails may stay off.");
     }
+    const bool audioReady = initializeAudio();
     resetTouchController();
 
     if (!g_tft->begin()) {
@@ -981,6 +1239,10 @@ void setup()
         Serial.println("QMI8658 ready; level attitude requires +X acceleration near 1 g.");
     } else {
         Serial.println("QMI8658 not detected; attitude will not update.");
+    }
+    if (audioReady && xTaskCreatePinnedToCore(
+            variometerAudioTask, "vario-audio", 4096, nullptr, 1, nullptr, 0) != pdPASS) {
+        Serial.println("Variometer audio task could not be started.");
     }
     renderBootScreen();
 
