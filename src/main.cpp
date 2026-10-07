@@ -68,7 +68,7 @@ constexpr uint16_t kLightGray = 0xAD55;
 constexpr uint16_t kNavy = 0x000F;
 constexpr uint16_t kRingEdge = 0x0861;
 constexpr uint16_t kYellow = 0xFFE0;
-constexpr int kBarometricSetting = 1024;
+constexpr int kBarometricSetting = 1013;
 
 enum ScreenMode {
     SCREEN_ATTITUDE = 0,
@@ -285,6 +285,7 @@ void variometerAudioTask(void *)
     constexpr float kVarioDeadbandFtPerMinute = 50.0f;
     constexpr float kMaximumClimbRateFtPerMinute = 3000.0f;
     constexpr float kVarioAmplitude = 26000.0f;
+    constexpr float kMaximumClimbBeepAmplitude = 31000.0f;
     constexpr float kTwoPi = 6.28318530718f;
     constexpr uint32_t kClimbBeepSamples = kSampleRate * 16 / 100;
     constexpr uint32_t kEnvelopeSamples = kSampleRate * 5 / 1000;
@@ -294,6 +295,7 @@ void variometerAudioTask(void *)
     float phase = 0.0f;
     float amplitudeEnvelope = 0.0f;
     float activeBeepFrequencyHz = 500.0f;
+    float activeBeepAmplitude = kVarioAmplitude;
     uint32_t activeBeepCycleSamples = 0;
     uint32_t beepSamplesRemaining = 0;
     uint32_t silenceSamplesRemaining = 0;
@@ -306,6 +308,7 @@ void variometerAudioTask(void *)
         const bool descending = filteredVerticalSpeed < -kVarioDeadbandFtPerMinute;
         const bool climbing = filteredVerticalSpeed > kVarioDeadbandFtPerMinute;
         float requestedBeepFrequencyHz = activeBeepFrequencyHz;
+        float requestedBeepAmplitude = kVarioAmplitude;
         uint32_t requestedBeepCycleSamples = 0;
         if (climbing) {
             const float climbRate = constrain(filteredVerticalSpeed,
@@ -314,6 +317,8 @@ void variometerAudioTask(void *)
             const float climbProgress = (climbRate - kVarioDeadbandFtPerMinute) /
                 (kMaximumClimbRateFtPerMinute - kVarioDeadbandFtPerMinute);
             requestedBeepFrequencyHz = 500.0f + climbProgress * 900.0f;
+            requestedBeepAmplitude = kVarioAmplitude + climbProgress *
+                (kMaximumClimbBeepAmplitude - kVarioAmplitude);
             const float intervalMs = 900.0f - climbProgress * 650.0f;
             requestedBeepCycleSamples =
                 static_cast<uint32_t>(intervalMs * kSampleRate / 1000.0f);
@@ -322,15 +327,18 @@ void variometerAudioTask(void *)
         for (size_t index = 0; index < kFrameSamples; ++index) {
             if (beepSamplesRemaining == 0 && climbing && silenceSamplesRemaining == 0) {
                 activeBeepFrequencyHz = requestedBeepFrequencyHz;
+                activeBeepAmplitude = requestedBeepAmplitude;
                 activeBeepCycleSamples = requestedBeepCycleSamples;
                 beepSamplesRemaining = kClimbBeepSamples;
             }
 
             bool audible = false;
             float frequencyHz = 260.0f;
+            float sampleAmplitude = kVarioAmplitude;
             if (beepSamplesRemaining > 0) {
                 audible = true;
                 frequencyHz = activeBeepFrequencyHz;
+                sampleAmplitude = activeBeepAmplitude;
                 --beepSamplesRemaining;
                 if (beepSamplesRemaining == 0) {
                     silenceSamplesRemaining = activeBeepCycleSamples - kClimbBeepSamples;
@@ -350,7 +358,7 @@ void variometerAudioTask(void *)
                 amplitudeEnvelope = fmaxf(0.0f, amplitudeEnvelope - kEnvelopeStep);
             }
             const int16_t sample = static_cast<int16_t>(
-                sinf(phase) * kVarioAmplitude * amplitudeEnvelope);
+                sinf(phase) * sampleAmplitude * amplitudeEnvelope);
             samples[index * 2] = sample;
             samples[index * 2 + 1] = sample;
             phase += kTwoPi * frequencyHz / kSampleRate;
